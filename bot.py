@@ -33,14 +33,20 @@ RCON_PASSWORD = os.getenv('RCON_PASSWORD')
 if not RCON_PASSWORD:
     raise ValueError("RCON_PASSWORD environment variable is required")
 
+REQUEST_CHANNEL_ID_STR = os.getenv('REQUEST_CHANNEL_ID')
+if not REQUEST_CHANNEL_ID_STR:
+    raise ValueError("REQUEST_CHANNEL_ID environment variable is required")
 try:
-    REQUEST_CHANNEL_ID = int(os.getenv('REQUEST_CHANNEL_ID'))
-except (TypeError, ValueError):
+    REQUEST_CHANNEL_ID = int(REQUEST_CHANNEL_ID_STR)
+except ValueError:
     raise ValueError("REQUEST_CHANNEL_ID must be a valid integer")
 
+ADMIN_CHANNEL_ID_STR = os.getenv('ADMIN_CHANNEL_ID')
+if not ADMIN_CHANNEL_ID_STR:
+    raise ValueError("ADMIN_CHANNEL_ID environment variable is required")
 try:
-    ADMIN_CHANNEL_ID = int(os.getenv('ADMIN_CHANNEL_ID'))
-except (TypeError, ValueError):
+    ADMIN_CHANNEL_ID = int(ADMIN_CHANNEL_ID_STR)
+except ValueError:
     raise ValueError("ADMIN_CHANNEL_ID must be a valid integer")
 
 # Setup Discord intents
