@@ -1,17 +1,36 @@
 import discord
 import os
+import re
 from dotenv import load_dotenv
 from mcrcon import MCRcon
 
 # Load environment variables
 load_dotenv()
 
+# Validate required environment variables
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+if not DISCORD_TOKEN:
+    raise ValueError("DISCORD_TOKEN environment variable is required")
+
 RCON_HOST = os.getenv('RCON_HOST')
+if not RCON_HOST:
+    raise ValueError("RCON_HOST environment variable is required")
+
 RCON_PORT = int(os.getenv('RCON_PORT', 25575))
+
 RCON_PASSWORD = os.getenv('RCON_PASSWORD')
-REQUEST_CHANNEL_ID = int(os.getenv('REQUEST_CHANNEL_ID'))
-ADMIN_CHANNEL_ID = int(os.getenv('ADMIN_CHANNEL_ID'))
+if not RCON_PASSWORD:
+    raise ValueError("RCON_PASSWORD environment variable is required")
+
+try:
+    REQUEST_CHANNEL_ID = int(os.getenv('REQUEST_CHANNEL_ID'))
+except (TypeError, ValueError):
+    raise ValueError("REQUEST_CHANNEL_ID must be a valid integer")
+
+try:
+    ADMIN_CHANNEL_ID = int(os.getenv('ADMIN_CHANNEL_ID'))
+except (TypeError, ValueError):
+    raise ValueError("ADMIN_CHANNEL_ID must be a valid integer")
 
 # Setup Discord intents
 intents = discord.Intents.default()
@@ -29,6 +48,14 @@ class WhitelistRequestView(discord.ui.View):
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.green)
     async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
+            # Validate username (Minecraft usernames are 3-16 alphanumeric characters and underscores)
+            if not re.match(r'^[a-zA-Z0-9_]{3,16}$', self.username):
+                await interaction.response.send_message(
+                    f"Invalid username format: {self.username}", 
+                    ephemeral=True
+                )
+                return
+            
             # Connect to RCON and whitelist the user
             with MCRcon(RCON_HOST, RCON_PASSWORD, RCON_PORT) as mcr:
                 response = mcr.command(f"whitelist add {self.username}")
@@ -77,6 +104,14 @@ async def on_message(message):
     if message.channel.id == REQUEST_CHANNEL_ID:
         # Extract username from message (assuming the message contains just the username)
         username = message.content.strip()
+        
+        # Validate username format (Minecraft usernames are 3-16 alphanumeric characters and underscores)
+        if not re.match(r'^[a-zA-Z0-9_]{3,16}$', username):
+            await message.channel.send(
+                f"Invalid username format. Minecraft usernames must be 3-16 characters, "
+                f"containing only letters, numbers, and underscores."
+            )
+            return
         
         # Create the view with approve/deny buttons
         view = WhitelistRequestView(username)
