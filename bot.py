@@ -1,8 +1,16 @@
 import discord
 import os
 import re
+import logging
 from dotenv import load_dotenv
 from mcrcon import MCRcon
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -16,7 +24,10 @@ RCON_HOST = os.getenv('RCON_HOST')
 if not RCON_HOST:
     raise ValueError("RCON_HOST environment variable is required")
 
-RCON_PORT = int(os.getenv('RCON_PORT', 25575))
+try:
+    RCON_PORT = int(os.getenv('RCON_PORT', 25575))
+except (TypeError, ValueError):
+    raise ValueError("RCON_PORT must be a valid integer")
 
 RCON_PASSWORD = os.getenv('RCON_PASSWORD')
 if not RCON_PASSWORD:
@@ -40,6 +51,14 @@ intents.guilds = True
 client = discord.Client(intents=intents)
 
 
+def is_valid_minecraft_username(username):
+    """
+    Validates a Minecraft username.
+    Minecraft usernames must be 3-16 characters, containing only letters, numbers, and underscores.
+    """
+    return bool(re.match(r'^[a-zA-Z0-9_]{3,16}$', username))
+
+
 class WhitelistRequestView(discord.ui.View):
     def __init__(self, username):
         super().__init__(timeout=None)
@@ -48,8 +67,8 @@ class WhitelistRequestView(discord.ui.View):
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.green)
     async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
-            # Validate username (Minecraft usernames are 3-16 alphanumeric characters and underscores)
-            if not re.match(r'^[a-zA-Z0-9_]{3,16}$', self.username):
+            # Validate username
+            if not is_valid_minecraft_username(self.username):
                 await interaction.response.send_message(
                     f"Invalid username format: {self.username}", 
                     ephemeral=True
@@ -59,7 +78,7 @@ class WhitelistRequestView(discord.ui.View):
             # Connect to RCON and whitelist the user
             with MCRcon(RCON_HOST, RCON_PASSWORD, RCON_PORT) as mcr:
                 response = mcr.command(f"whitelist add {self.username}")
-                print(f"RCON Response: {response}")
+                logger.info(f"RCON Response: {response}")
             
             # Update the message to show approval
             embed = interaction.message.embeds[0]
@@ -75,7 +94,7 @@ class WhitelistRequestView(discord.ui.View):
                 f"Error connecting to RCON or executing command: {str(e)}", 
                 ephemeral=True
             )
-            print(f"RCON Error: {e}")
+            logger.error(f"RCON Error: {e}")
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.red)
     async def deny_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -91,7 +110,7 @@ class WhitelistRequestView(discord.ui.View):
 
 @client.event
 async def on_ready():
-    print(f'{client.user} has connected to Discord!')
+    logger.info(f'{client.user} has connected to Discord!')
 
 
 @client.event
@@ -105,8 +124,8 @@ async def on_message(message):
         # Extract username from message (assuming the message contains just the username)
         username = message.content.strip()
         
-        # Validate username format (Minecraft usernames are 3-16 alphanumeric characters and underscores)
-        if not re.match(r'^[a-zA-Z0-9_]{3,16}$', username):
+        # Validate username format
+        if not is_valid_minecraft_username(username):
             await message.channel.send(
                 f"Invalid username format. Minecraft usernames must be 3-16 characters, "
                 f"containing only letters, numbers, and underscores."
@@ -131,7 +150,12 @@ async def on_message(message):
         if admin_channel:
             await admin_channel.send(embed=embed, view=view)
         else:
-            print(f"Error: Could not find admin channel with ID {ADMIN_CHANNEL_ID}")
+            error_msg = f"Could not find admin channel with ID {ADMIN_CHANNEL_ID}"
+            logger.error(error_msg)
+            await message.channel.send(
+                "Sorry, there was an error processing your whitelist request. "
+                "Please contact an administrator."
+            )
 
 
 # Run the bot
