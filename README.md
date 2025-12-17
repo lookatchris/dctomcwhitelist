@@ -43,6 +43,9 @@ RCON_PORT=25575
 RCON_PASSWORD=your_rcon_password
 REQUEST_CHANNEL_ID=123456789012345678
 ADMIN_CHANNEL_ID=123456789012345678
+ADMIN_ROLE_IDS=111111111111111111,222222222222222222  # comma-separated admin roles; or use ADMIN_ROLE_ID for a single role
+WARN_ROLE_ID_1=333333333333333333  # role applied at warning level 1
+WARN_ROLE_ID_2=444444444444444444  # role applied at warning level 2
 ```
 
 ### Getting Discord Channel IDs

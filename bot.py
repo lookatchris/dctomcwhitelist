@@ -1,1086 +1,999 @@
+"""Discord Whitelist Bot - Main entry point."""
+
 import discord
 from discord import app_commands
-import os
-import re
 import logging
 import asyncio
-import httpx
-import struct
-from dotenv import load_dotenv
-from mcrcon import MCRcon
 from concurrent.futures import ThreadPoolExecutor
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+from config import (
+    DISCORD_TOKEN,
+    ADMIN_ROLE_ID,
+    ADMIN_ROLE_IDS,
+    OWNER_USER_ID,
+    ADMIN_CHANNEL_ID,
+    SUPPORT_CHANNEL_ID,
+    SUPPORT_ROLE_ID,
+    SUPPORT_NOTIFIER_ROLE_ID,
+    ARCHIVE_CATEGORY_ID,
+    APPEAL_CATEGORY_ID,
+    REQUEST_CHANNEL_IDS,
+    ENABLE_HEALTH_CHECKS,
+    MESSAGE_CLEANUP_DELAY_SECONDS,
+    DEBUG,
+    RCON_HOST,
+    RCON_PORT,
+    STATUS_TYPE,
+    STATUS_TEXT,
+    STATUS_STREAM_URL,
+    WARN_ROLE_ID_1,
+    WARN_ROLE_ID_2,
 )
+from views import (
+    InvalidUsernameView,
+    NonAppealableView,
+    AppealableView,
+    ClearConfirmView,
+    WhitelistRequestView,
+    WarningAcknowledgeView,
+    SupportLauncherView,
+    SupportCaseView,
+)
+from health import periodic_health_checks_loop, perform_health_check
+from handlers import (
+    handle_whitelist_request,
+    scan_unhandled_requests,
+)
+from appeal_channels import is_temporary_channel, can_user_close_channel
+import warn_history
+
+# Configure logging with file handlers
+import os
+from logging.handlers import RotatingFileHandler
+
+# Create logs directory if it doesn't exist
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+
+# Configure formatters
+detailed_formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+# Root logger configuration
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+
+# Remove any existing handlers
+root_logger.handlers.clear()
+
+# Console handler (stdout)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+console_handler.setFormatter(detailed_formatter)
+root_logger.addHandler(console_handler)
+
+# General log file (all logs, excluding debug if disabled)
+general_handler = RotatingFileHandler(
+    os.path.join(log_dir, "general.log"),
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5
+)
+general_handler.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+general_handler.setFormatter(detailed_formatter)
+root_logger.addHandler(general_handler)
+
+# Info log file
+info_handler = RotatingFileHandler(
+    os.path.join(log_dir, "info.log"),
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5
+)
+info_handler.setLevel(logging.INFO)
+info_handler.setFormatter(detailed_formatter)
+root_logger.addHandler(info_handler)
+
+# Warning log file
+warning_handler = RotatingFileHandler(
+    os.path.join(log_dir, "warning.log"),
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5
+)
+warning_handler.setLevel(logging.WARNING)
+warning_handler.setFormatter(detailed_formatter)
+root_logger.addHandler(warning_handler)
+
+# Error log file
+error_handler = RotatingFileHandler(
+    os.path.join(log_dir, "error.log"),
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5
+)
+error_handler.setLevel(logging.ERROR)
+error_handler.setFormatter(detailed_formatter)
+root_logger.addHandler(error_handler)
+
+# Debug log file (only if DEBUG is enabled)
+if DEBUG:
+    debug_handler = RotatingFileHandler(
+        os.path.join(log_dir, "debug.log"),
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5
+    )
+    debug_handler.setLevel(logging.DEBUG)
+    debug_handler.setFormatter(detailed_formatter)
+    root_logger.addHandler(debug_handler)
+
 logger = logging.getLogger(__name__)
-
-# Load environment variables
-load_dotenv()
-
-# Validate required environment variables
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-if not DISCORD_TOKEN:
-    raise ValueError("DISCORD_TOKEN environment variable is required")
-
-RCON_HOST = os.getenv('RCON_HOST')
-if not RCON_HOST:
-    raise ValueError("RCON_HOST environment variable is required")
-
-try:
-    RCON_PORT = int(os.getenv('RCON_PORT', 25575))
-except (TypeError, ValueError):
-    raise ValueError("RCON_PORT must be a valid integer")
-
-RCON_PASSWORD = os.getenv('RCON_PASSWORD')
-if not RCON_PASSWORD:
-    raise ValueError("RCON_PASSWORD environment variable is required")
-
-REQUEST_CHANNEL_ID_STR = os.getenv('REQUEST_CHANNEL_ID')
-if not REQUEST_CHANNEL_ID_STR:
-    raise ValueError("REQUEST_CHANNEL_ID environment variable is required")
-try:
-    REQUEST_CHANNEL_ID = int(REQUEST_CHANNEL_ID_STR)
-except ValueError:
-    raise ValueError("REQUEST_CHANNEL_ID must be a valid integer")
-
-ADMIN_CHANNEL_ID_STR = os.getenv('ADMIN_CHANNEL_ID')
-if not ADMIN_CHANNEL_ID_STR:
-    raise ValueError("ADMIN_CHANNEL_ID environment variable is required")
-try:
-    ADMIN_CHANNEL_ID = int(ADMIN_CHANNEL_ID_STR)
-except ValueError:
-    raise ValueError("ADMIN_CHANNEL_ID must be a valid integer")
-
-ADMIN_ROLE_ID_STR = os.getenv('ADMIN_ROLE_ID')
-if not ADMIN_ROLE_ID_STR:
-    raise ValueError("ADMIN_ROLE_ID environment variable is required")
-try:
-    ADMIN_ROLE_ID = int(ADMIN_ROLE_ID_STR)
-except ValueError:
-    raise ValueError("ADMIN_ROLE_ID must be a valid integer")
-
-# Optional health check interval (seconds)
-try:
-    HEALTH_CHECK_INTERVAL = int(os.getenv('HEALTH_CHECK_INTERVAL', 3600))
-except (TypeError, ValueError):
-    HEALTH_CHECK_INTERVAL = 3600
-
-# Optional health check enable/disable
-ENABLE_HEALTH_CHECKS = os.getenv('ENABLE_HEALTH_CHECKS', 'true').lower() in ('true', '1', 'yes', 'on')
-
-# Optional appeal category ID
-APPEAL_CATEGORY_ID_STR = os.getenv('APPEAL_CATEGORY_ID')
-APPEAL_CATEGORY_ID = None
-if APPEAL_CATEGORY_ID_STR:
-    try:
-        APPEAL_CATEGORY_ID = int(APPEAL_CATEGORY_ID_STR)
-    except ValueError:
-        logger.warning("APPEAL_CATEGORY_ID must be a valid integer, ignoring")
+logger.info(f"Logging configured - DEBUG={'enabled' if DEBUG else 'disabled'}")
 
 # Setup Discord intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 
+
+def is_admin(interaction: discord.Interaction) -> bool:
+    """Check if user is bot owner or has an admin role."""
+    # Bot owner always has admin permissions
+    if OWNER_USER_ID and interaction.user.id == OWNER_USER_ID:
+        return True
+    
+    # Check if user has any admin role (only works in guilds with Member objects)
+    if hasattr(interaction.user, 'roles'):
+        user_role_ids = {role.id for role in interaction.user.roles}
+        return any(admin_role_id in user_role_ids for admin_role_id in ADMIN_ROLE_IDS)
+    
+    return False
+
+
+def has_admin_role():
+    """Decorator to check admin permissions (owner or admin role)."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if not is_admin(interaction):
+            raise app_commands.MissingRole(ADMIN_ROLE_ID)
+        return True
+    
+    return app_commands.check(predicate)
+
+
 class MyClient(discord.Client):
+    """Custom Discord client with command tree and thread executor."""
+    
     def __init__(self, *, intents: discord.Intents):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.executor = ThreadPoolExecutor(max_workers=2)
+        self.cleanup_map = {}  # Track cleanup tasks for invalid requests
+        self.warn_map = {}     # Track warnings per user_id -> list of reasons
+
+
+def _warning_level_from_roles(member: discord.Member) -> int:
+    """Return warning level based on roles: 2 if WARN_ROLE_ID_2 present, 1 if WARN_ROLE_ID_1, else 0."""
+    role_ids = {r.id for r in getattr(member, 'roles', [])}
+    if WARN_ROLE_ID_2 in role_ids:
+        return 2
+    if WARN_ROLE_ID_1 in role_ids:
+        return 1
+    return 0
 
     async def setup_hook(self):
-        await self.tree.sync()
-        logger.info("Command tree synced")
+        """Called after client connects; syncs commands and registers persistent views."""
+        try:
+            synced = await self.tree.sync()
+            logger.info(f"Command tree synced: {len(synced)} commands")
+            for cmd in synced:
+                logger.info(f"  - /{cmd.name}: {cmd.description}")
+        except Exception as e:
+            logger.error(f"Failed to sync command tree: {e}")
+        
         # Register persistent views so buttons continue working after restarts
+        # Only register views with timeout=None (truly persistent)
         try:
             self.add_view(InvalidUsernameView())
             self.add_view(NonAppealableView())
             self.add_view(AppealableView())
-            self.add_view(ClearConfirmView())
+            self.add_view(WhitelistRequestView())
+            self.add_view(WarningAcknowledgeView())
+            self.add_view(SupportLauncherView())
+            self.add_view(SupportCaseView())
+            # Note: ConfirmAcknowledgeView, ConfirmWarningAcknowledgeView, and ClearConfirmView are ephemeral (have timeouts)
+            # and should NOT be registered as persistent
             logger.info("Persistent views registered")
         except Exception as e:
             logger.error(f"Failed to register persistent views: {e}")
 
+
 client = MyClient(intents=intents)
 
-# Track invalid request messages and bot error replies for cleanup
-# Key: (channel_id, author_id) -> { 'user_msg': Message, 'error_msg': Message, 'task': asyncio.Task }
-cleanup_map = {}
 
-async def _delete_message_safe(msg):
-    try:
-        await msg.delete()
-    except Exception as e:
-        logger.warning(f"Failed to delete message {getattr(msg, 'id', None)}: {e}")
-
-async def _cleanup_entry_now(key):
-    entry = cleanup_map.get(key)
-    if not entry:
-        return
-    task = entry.get('task')
-    if task and not task.done():
+@client.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Handle errors from slash commands."""
+    if isinstance(error, app_commands.MissingRole):
+        # User doesn't have permission - send message and cleanup after delay
         try:
-            task.cancel()
-        except Exception:
-            pass
-    # delete messages
-    for m in [entry.get('user_msg'), entry.get('error_msg')]:
-        if m:
-            await _delete_message_safe(m)
-    cleanup_map.pop(key, None)
-
-async def _schedule_cleanup(key, user_msg, error_msg, delay_seconds=300):
-    # cancel prior
-    await _cleanup_entry_now(key)
-    async def _runner():
-        try:
-            await asyncio.sleep(delay_seconds)
-            # delete if still present
-            await _delete_message_safe(user_msg)
-            await _delete_message_safe(error_msg)
-        finally:
-            cleanup_map.pop(key, None)
-    task = asyncio.create_task(_runner())
-    cleanup_map[key] = {'user_msg': user_msg, 'error_msg': error_msg, 'task': task}
-
-
-async def _delete_channel_after(channel: discord.TextChannel, delay_seconds: int):
-    try:
-        await asyncio.sleep(delay_seconds)
-        await channel.delete(reason=f"Auto-cleanup after {delay_seconds} seconds")
-    except Exception as e:
-        logger.warning(f"Auto-delete appeal channel failed: {e}")
-
-
-def is_valid_minecraft_username(username):
-    """
-    Validates a Minecraft username format.
-    Minecraft usernames must be 3-16 characters, containing only letters, numbers, and underscores.
-    """
-    return bool(re.match(r'^[a-zA-Z0-9_]{3,16}$', username))
-
-
-# Temporary channel helpers
-def is_temporary_channel(channel: discord.abc.GuildChannel) -> bool:
-    topic = getattr(channel, 'topic', '') or ''
-    # Treat any channel in the configured appeal category as temporary
-    try:
-        category_id = getattr(channel, 'category_id', None)
-        if category_id is None:
-            cat = getattr(channel, 'category', None)
-            category_id = getattr(cat, 'id', None) if cat else None
-        if APPEAL_CATEGORY_ID and category_id == APPEAL_CATEGORY_ID:
-            return True
-    except Exception:
-        pass
-    return (
-        'Appeal channel for whitelist denial' in topic or
-        'Invalid username notification' in topic
-    )
-
-
-def can_user_close_channel(user: discord.Member, channel: discord.abc.GuildChannel) -> bool:
-    """Admins can always close. For appeal channels, the denier can also close."""
-    guild = user.guild
-    if not guild:
-        return False
-    admin_role = guild.get_role(ADMIN_ROLE_ID)
-    if admin_role and admin_role in getattr(user, 'roles', []):
-        return True
-    # Check denier for appeal channels
-    topic = getattr(channel, 'topic', '') or ''
-    if 'Appeal channel for whitelist denial' in topic:
-        denier_id = AppealViewHelpers._parse_id(topic, 'denier')
-        if denier_id and user.id == denier_id:
-            return True
-    return False
-
-
-async def check_mojang_username(username):
-    """
-    Check if a Minecraft username exists via Mojang API.
-    Returns (exists: bool, uuid: str or None, error: str or None)
-    """
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(f"https://api.mojang.com/users/profiles/minecraft/{username}")
-            if response.status_code == 200:
-                data = response.json()
-                return (True, data.get('id'), None)
-            elif response.status_code == 404:
-                return (False, None, "Username does not exist")
-            else:
-                return (False, None, f"API returned status {response.status_code}")
-    except httpx.TimeoutException:
-        return (False, None, "Mojang API timeout")
-    except Exception as e:
-        return (False, None, f"API error: {str(e)}")
-
-
-async def check_if_whitelisted(username):
-    """Async wrapper to check if player is whitelisted."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(client.executor, _check_whitelist_sync, username)
-
-
-class WhitelistRequestView(discord.ui.View):
-    def __init__(self, username, request_message=None, request_user=None):
-        super().__init__(timeout=None)
-        self.username = username
-        self.request_message = request_message
-        self.request_user = request_user
-
-    @discord.ui.button(label="Approve", style=discord.ButtonStyle.green)
-    async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Show modal for approval reason
-        modal = ApprovalReasonModal(self.username, self.request_message, self.request_user)
-        await interaction.response.send_modal(modal)
-
-    @discord.ui.button(label="Deny", style=discord.ButtonStyle.red)
-    async def deny_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Show modal for denial reason
-        modal = DenialReasonModal(self.username, self.request_message, self.request_user, interaction.user)
-        await interaction.response.send_modal(modal)
-
-
-# Base helper methods for appeal views
-class AppealViewHelpers:
-    @staticmethod
-    def _parse_id(topic: str | None, key: str) -> int | None:
-        if not topic:
-            return None
-        import re
-        m = re.search(rf"{key}\s*:\s*(\d+)", topic)
-        if m:
-            try:
-                return int(m.group(1))
-            except Exception:
-                return None
-        return None
-    
-    @staticmethod
-    def _parse_bool(topic: str | None, key: str) -> bool:
-        if not topic:
-            return False
-        import re
-        m = re.search(rf"{key}\s*:\s*(True|False)", topic, re.IGNORECASE)
-        if m:
-            return m.group(1).lower() == 'true'
-        return False
-
-    @staticmethod
-    def _is_admin_or_denier(interaction: discord.Interaction) -> bool:
-        user = interaction.user
-        guild = interaction.guild
-        if not guild:
-            return False
-        denier_id = AppealViewHelpers._parse_id(getattr(interaction.channel, 'topic', None), 'denier')
-        if denier_id and user.id == denier_id:
-            return True
-        admin_role = guild.get_role(ADMIN_ROLE_ID)
-        if admin_role and admin_role in getattr(user, 'roles', []):
-            return True
-        return False
-
-    @staticmethod
-    def _is_request_user(interaction: discord.Interaction) -> bool:
-        uid = AppealViewHelpers._parse_id(getattr(interaction.channel, 'topic', None), 'user')
-        return uid is not None and interaction.user.id == uid
-
-
-# View for invalid username notifications - only Acknowledge button
-class InvalidUsernameView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Acknowledge", style=discord.ButtonStyle.primary, custom_id="invalid_username_ack_button")
-    async def ack_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Allow anyone to acknowledge invalid username notifications
-        # Show confirmation with buttons
-        try:
-            await interaction.response.send_message(
-                "⚠️ Acknowledging will close this channel. Please confirm.",
-                ephemeral=True,
-                view=ConfirmAcknowledgeView(appealable=False)
+            # Send the error message
+            error_msg = await interaction.response.send_message(
+                f"❌ You do not have permission to run this command. Required role: <@&{ADMIN_ROLE_ID}>",
+                ephemeral=False
             )
+            
+            # Delete the command message if possible
+            try:
+                await interaction.message.delete()
+            except:
+                pass  # Command message might be from interaction, not a regular message
+            
+            # Schedule deletion of the error message
+            await asyncio.sleep(MESSAGE_CLEANUP_DELAY_SECONDS)
+            try:
+                await error_msg.delete()
+            except:
+                pass  # Message might have already been deleted
         except Exception as e:
-            logger.error(f"Failed to show acknowledge confirmation: {e}")
-
-
-# View for non-appealable denials - only Acknowledge button
-class NonAppealableView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Acknowledge", style=discord.ButtonStyle.primary, custom_id="non_appeal_ack_button")
-    async def ack_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # if not AppealViewHelpers._is_request_user(interaction):
-        #     await interaction.response.send_message("Only the requester can acknowledge this.", ephemeral=True)
-        #     return
-        # # Show confirmation with buttons
-        try:
-            await interaction.response.send_message(
-                "⚠️ Acknowledging will close this channel. Please confirm.",
-                ephemeral=True,
-                view=ConfirmAcknowledgeView(appealable=False)
-            )
-        except Exception as e:
-            logger.error(f"Failed to show acknowledge confirmation: {e}")
-
-
-# View for appealable denials - Acknowledge + Close Appeal buttons
-class AppealableView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Acknowledge", style=discord.ButtonStyle.primary, custom_id="appealable_ack_button")
-    async def ack_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not AppealViewHelpers._is_request_user(interaction):
-            await interaction.response.send_message("Only the requester can acknowledge this.", ephemeral=True)
-            return
-        # For appealable: hide channel from user and notify admins
-        try:
-            await interaction.response.send_message(
-                "⚠️ Acknowledging will hide this channel from you and notify admins. The admins will then close or delete it. Are you sure?",
-                ephemeral=True,
-                view=ConfirmAcknowledgeView(appealable=True)
-            )
-        except Exception as e:
-            logger.error(f"Failed to show acknowledge confirmation: {e}")
-
-    @discord.ui.button(label="Close Appeal", style=discord.ButtonStyle.danger, custom_id="appealable_close_button")
-    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not AppealViewHelpers._is_admin_or_denier(interaction):
-            await interaction.response.send_message("You do not have permission to close this appeal.", ephemeral=True)
-            return
-        try:
-            await interaction.response.send_message("Closing appeal and deleting channel...", ephemeral=True)
-            await interaction.channel.delete(reason=f"Appeal closed by {interaction.user}")
-        except Exception as e:
-            logger.error(f"Failed to delete appeal channel: {e}")
+            logger.error(f"Failed to handle MissingRole error: {e}")
+    else:
+        # Other errors - log and defer response if not already responded
+        logger.error(f"Unhandled app command error: {error}", exc_info=error)
+        if not interaction.response.is_done():
             try:
-                await interaction.followup.send(f"Failed to delete channel: {e}", ephemeral=True)
-            except Exception:
-                pass
-
-
-class ConfirmAcknowledgeView(discord.ui.View):
-    def __init__(self, appealable: bool = False):
-        super().__init__(timeout=60)
-        self.appealable = appealable
-
-    @discord.ui.button(label="Yes, confirm!", style=discord.ButtonStyle.danger, custom_id="appeal_ack_confirm")
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Only request user can confirm
-        def _is_request_user(inter: discord.Interaction) -> bool:
-            uid = AppealViewHelpers._parse_id(getattr(inter.channel, 'topic', None), 'user')
-            return uid is not None and inter.user.id == uid
-        if not _is_request_user(interaction):
-            await interaction.response.send_message("Only the requester can close this appeal.", ephemeral=True)
-            return
-        
-        if self.appealable:
-            # Hide channel from user, notify admins
-            try:
-                channel = interaction.channel
-                user = interaction.user
-                
-                # Remove read permissions for the user
-                await channel.set_permissions(user, read_messages=False, reason="User acknowledged appeal")
-                
-                # Notify admins
-                admin_role = interaction.guild.get_role(ADMIN_ROLE_ID)
-                if admin_role:
-                    await channel.send(f"{admin_role.mention} The user has acknowledged and can no longer see this channel. You may close it when ready.")
-                
-                await interaction.response.send_message("You have acknowledged this appeal. You can no longer see this channel.", ephemeral=True)
-            except Exception as e:
-                logger.error(f"Failed to hide channel from user: {e}")
-                try:
-                    await interaction.response.send_message(f"Failed to update channel: {e}", ephemeral=True)
-                except Exception:
-                    pass
-        else:
-            # Non-appealable: delete channel
-            try:
-                await interaction.response.send_message("Closing this channel...", ephemeral=True)
-                await interaction.channel.delete(reason=f"Appeal acknowledged by requester {interaction.user}")
-            except Exception as e:
-                logger.error(f"Failed to delete appeal channel on confirm: {e}")
-                try:
-                    await interaction.followup.send(f"Failed to delete channel: {e}", ephemeral=True)
-                except Exception:
-                    pass
-
-    @discord.ui.button(label="No, keep open", style=discord.ButtonStyle.secondary, custom_id="appeal_ack_cancel")
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("Okay, keeping the appeal channel open.", ephemeral=True)
-
-
-# Confirmation view for !clear command
-class ClearConfirmView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=60)
-
-    def _authorized(self, interaction: discord.Interaction) -> bool:
-        # Same authorization as !close
-        user = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
-        return bool(user and can_user_close_channel(user, interaction.channel))
-
-    @discord.ui.button(label="Yes, clear messages", style=discord.ButtonStyle.danger, custom_id="confirm_clear_yes")
-    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self._authorized(interaction):
-            await interaction.response.send_message("You do not have permission to clear this channel.", ephemeral=True)
-            return
-        try:
-            await interaction.response.send_message("Clearing messages...", ephemeral=True)
-            # Prefer purging non-pinned messages
-            deleted = 0
-            channel = interaction.channel
-            try:
-                def not_pinned(m: discord.Message) -> bool:
-                    return not m.pinned
-                deleted_messages = await channel.purge(limit=None, check=not_pinned, bulk=True)
-                deleted = len(deleted_messages)
-            except Exception as purge_err:
-                logger.warning(f"Bulk purge failed, falling back to manual delete: {purge_err}")
-                async for msg in channel.history(limit=None, oldest_first=True):
-                    if not msg.pinned:
-                        try:
-                            await msg.delete()
-                            deleted += 1
-                        except Exception:
-                            pass
-            try:
-                await interaction.followup.send(f"Cleared {deleted} messages (pinned kept).", ephemeral=True)
-            except Exception:
-                pass
-        except Exception as e:
-            logger.error(f"Failed to clear channel: {e}")
-            try:
-                await interaction.followup.send(f"Failed to clear: {e}", ephemeral=True)
-            except Exception:
-                pass
-
-    @discord.ui.button(label="No, cancel", style=discord.ButtonStyle.secondary, custom_id="confirm_clear_no")
-    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("Clear cancelled.", ephemeral=True)
-
-
-class ApprovalReasonModal(discord.ui.Modal, title="Approve Whitelist Request"):
-    reason = discord.ui.TextInput(
-        label="Approval Reason (optional)",
-        placeholder="Provide a reason for approval",
-        required=False,
-        max_length=200
-    )
-
-    def __init__(self, username, request_message=None, request_user=None):
-        super().__init__()
-        self.username = username
-        self.request_message = request_message
-        self.request_user = request_user
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            # Validate username
-            if not is_valid_minecraft_username(self.username):
                 await interaction.response.send_message(
-                    f"Invalid username format: {self.username}", 
+                    "An error occurred while executing this command.",
                     ephemeral=True
                 )
-                return
-            
-            # Connect to RCON and whitelist the user
-            with MCRcon(RCON_HOST, RCON_PASSWORD, RCON_PORT) as mcr:
-                response = mcr.command(f"whitelist add {self.username}")
-                logger.info(f"RCON Response: {response}")
-            
-            reason_text = str(self.reason) if self.reason else "No reason provided"
-            
-            # Update the admin message to show approval
-            embed = interaction.message.embeds[0]
-            embed.color = discord.Color.green()
-            embed.title = "Whitelist Request - Approved"
-            embed.add_field(name="Status", value="✅ Approved", inline=False)
-            embed.add_field(name="Approved by", value=interaction.user.mention, inline=False)
-            embed.add_field(name="Reason", value=reason_text, inline=False)
-            
-            await interaction.response.edit_message(embed=embed, view=None)
-            
-            # Add checkmark to original request message if available
-            if self.request_message:
-                try:
-                    await self.request_message.add_reaction("✅")
-                    # Remove pending hourglass if present
-                    try:
-                        await self.request_message.remove_reaction("⏳", interaction.client.user)
-                    except Exception:
-                        pass
-                except Exception as e:
-                    logger.error(f"Failed to add checkmark to request message: {e}")
-            
-        except Exception as e:
-            await interaction.response.send_message(
-                f"Error connecting to RCON or executing command: {str(e)}", 
-                ephemeral=True
-            )
-            logger.error(f"RCON Error: {e}")
-
-
-class DenialReasonModal(discord.ui.Modal, title="Deny Whitelist Request"):
-    reason = discord.ui.TextInput(
-        label="Denial Reason (optional)",
-        placeholder="Provide a reason for denial",
-        required=False,
-        max_length=200
-    )
-    appeal_allowed = discord.ui.TextInput(
-        label="Appeal allowed? (yes/no)",
-        placeholder="yes",
-        required=True,
-        max_length=10
-    )
-
-    def __init__(self, username, request_message=None, request_user=None, admin=None):
-        super().__init__()
-        self.username = username
-        self.request_message = request_message
-        self.request_user = request_user
-        self.admin = admin
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            reason_text = str(self.reason) if self.reason else "No reason provided"
-            appeal_raw = (str(self.appeal_allowed) or "yes").strip().lower()
-            appeal_possible = appeal_raw in ("yes", "y", "true", "1", "✅", "allowed", "ok")
-            
-            # Update the admin message to show denial
-            embed = interaction.message.embeds[0]
-            embed.color = discord.Color.red()
-            embed.title = "Whitelist Request - Denied"
-            embed.add_field(name="Status", value="❌ Denied", inline=False)
-            embed.add_field(name="Denied by", value=interaction.user.mention, inline=False)
-            embed.add_field(name="Reason", value=reason_text, inline=False)
-            embed.add_field(name="Appeal", value=("✅ Possible" if appeal_possible else "❌ Not possible"), inline=False)
-            
-            await interaction.response.edit_message(embed=embed, view=None)
-            
-            # Delete original request message
-            if self.request_message:
-                try:
-                    await self.request_message.delete()
-                    logger.info(f"Deleted request message for {self.username}")
-                except Exception as e:
-                    logger.error(f"Failed to delete request message: {e}")
-            
-            # Create private channel to notify user
-            if self.request_user:
-                try:
-                    guild = interaction.guild
-                    if guild:
-                        # Get category if configured
-                        category = None
-                        if APPEAL_CATEGORY_ID:
-                            category = guild.get_channel(APPEAL_CATEGORY_ID)
-                            if category and not isinstance(category, discord.CategoryChannel):
-                                logger.warning(f"APPEAL_CATEGORY_ID {APPEAL_CATEGORY_ID} is not a category channel")
-                                category = None
-                        
-                        # Create private channel with user and bot
-                        private_channel = await guild.create_text_channel(
-                            name=f"appeal-{self.request_user.name}",
-                            topic=f"Appeal channel for whitelist denial of {self.username} | denier: {interaction.user.id} | user: {self.request_user.id} | appeal: {appeal_possible}",
-                            category=category
-                        )
-                        
-                        # Set permissions: only bot, user, denier, and admin role can see
-                        # If appeal is possible, user can send messages; otherwise read-only
-                        await private_channel.set_permissions(guild.default_role, view_channel=False)
-                        await private_channel.set_permissions(self.request_user, view_channel=True, send_messages=appeal_possible)
-                        await private_channel.set_permissions(interaction.client.user, view_channel=True, send_messages=True)
-                        await private_channel.set_permissions(interaction.user, view_channel=True, send_messages=True)  # Add denier
-                        
-                        # Add admin role permissions
-                        admin_role = guild.get_role(ADMIN_ROLE_ID)
-                        if admin_role:
-                            await private_channel.set_permissions(admin_role, view_channel=True, send_messages=True)
-                        
-                        # Send denial notification in the channel
-                        deny_embed = discord.Embed(
-                            title="Whitelist Request - Denied",
-                            description=f"Your whitelist request for `{self.username}` has been **denied**.",
-                            color=discord.Color.red()
-                        )
-                        deny_embed.add_field(name="Reason", value=reason_text, inline=False)
-                        #deny_embed.add_field(name="Denied by", value=interaction.user.mention, inline=False)
-                        if appeal_possible:
-                            deny_embed.add_field(name="Next Steps", value=f"Appeal is possible. Use Acknowledge to close this appeal.", inline=False)
-                            view = AppealableView()
-                            admin_status = "✅ Appeal channel created"
-                        else:
-                            deny_embed.add_field(name="Next Steps", value=f"Appeal is not possible. Please acknowledge to close this message.", inline=False)
-                            view = NonAppealableView()
-                            admin_status = "❌ Appeal not possible (read-only channel)"
-
-                        await private_channel.send(f"{self.request_user.mention}", embed=deny_embed, view=view)
-                        # Reflect channel creation and appeal policy in the admin embed
-                        try:
-                            embed.add_field(name="Appeal Channel", value=admin_status, inline=False)
-                            await interaction.message.edit(embed=embed)
-                        except Exception as e:
-                            logger.warning(f"Failed to update admin message with appeal info: {e}")
-                        logger.info(f"Created private appeal channel {private_channel.name} for {self.request_user}")
-                except Exception as e:
-                    logger.error(f"Failed to create private appeal channel: {e}")
-            
-        except Exception as e:
-            await interaction.response.send_message(
-                f"Error processing denial: {str(e)}", 
-                ephemeral=True
-            )
-            logger.error(f"Denial Error: {e}")
-
-
-def _check_rcon_sync():
-    """Synchronous RCON check to run in thread executor."""
-    import socket
-    try:
-        # Directly use socket to avoid MCRcon's signal usage
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5.0)
-        sock.connect((RCON_HOST, RCON_PORT))
-        sock.close()
-        return (True, "Connection successful (basic check)")
-    except socket.timeout:
-        return (False, "Connection timeout")
-    except socket.error as e:
-        return (False, f"Socket error: {e}")
-    except Exception as e:
-        return (False, str(e))
-
-
-def _rcon_exec_sync(command: str, timeout: float = 5.0):
-    """Minimal RCON exec without signals; returns payload string or raises."""
-    import socket
-    def send_packet(sock, req_id, req_type, payload_str):
-        payload = payload_str.encode('utf-8')
-        length = 4 + 4 + len(payload) + 2  # id + type + payload + 2 null bytes
-        packet = struct.pack('<iii', length, req_id, req_type) + payload + b'\x00\x00'
-        sock.sendall(packet)
-    def recv_packet(sock):
-        # read length
-        header = sock.recv(4)
-        if not header or len(header) < 4:
-            raise RuntimeError('RCON: incomplete header')
-        (length,) = struct.unpack('<i', header)
-        body = b''
-        while len(body) < length:
-            chunk = sock.recv(length - len(body))
-            if not chunk:
-                break
-            body += chunk
-        if len(body) < 8:
-            raise RuntimeError('RCON: incomplete body')
-        req_id, req_type = struct.unpack('<ii', body[:8])
-        payload = body[8:]
-        # strip trailing two nulls if present
-        if payload.endswith(b'\x00\x00'):
-            payload = payload[:-2]
-        return req_id, req_type, payload.decode('utf-8', errors='replace')
-
-    sock = socket.create_connection((RCON_HOST, RCON_PORT), timeout=timeout)
-    sock.settimeout(timeout)
-    try:
-        # authenticate
-        send_packet(sock, 0x1234, 3, RCON_PASSWORD)
-        rid, rtype, payload = recv_packet(sock)
-        if rid == -1:
-            raise RuntimeError('RCON auth failed')
-        # exec command
-        send_packet(sock, 0x1235, 2, command)
-        rid, rtype, payload = recv_packet(sock)
-        return payload
-    finally:
-        try:
-            sock.close()
-        except Exception:
-            pass
-
-
-def _check_whitelist_sync(username):
-    """Check if a player is whitelisted. Returns (is_whitelisted: bool, error: str or None)"""
-    try:
-        response = _rcon_exec_sync('whitelist list')
-        if not response:
-            return (False, None)
-        # parse names after colon
-        names_part = ''
-        if ':' in response:
-            names_part = response.split(':', 1)[1]
-        names = [n.strip().lower() for n in names_part.split(',') if n.strip()]
-        is_white = username.lower() in names
-        logger.info(f"Whitelist check for {username}: {'YES' if is_white else 'NO'}")
-        return (is_white, None)
-    except Exception as e:
-        logger.error(f"Error checking whitelist for {username}: {e}")
-        return (False, str(e))
-
-
-async def perform_health_check():
-    """Run checks: guild presence, channel access, and RCON connectivity. Return a discord.Embed."""
-    logger.info("Performing health check")
-    embed = discord.Embed(title="Bot Health Check", color=discord.Color.blue())
-
-    # Guild presence
-    guild_count = len(client.guilds)
-    embed.add_field(name="Guilds connected", value=str(guild_count), inline=False)
-
-    # Channel access checks
-    req_channel = client.get_channel(REQUEST_CHANNEL_ID)
-    admin_channel = client.get_channel(ADMIN_CHANNEL_ID)
-
-    def check_channel(channel):
-        if not channel:
-            return (False, "Not found")
-        guild = getattr(channel, 'guild', None)
-        member = None
-        if guild:
-            member = guild.get_member(client.user.id)
-        if not member:
-            return (False, "Bot not a member of channel's guild")
-        perms = channel.permissions_for(member)
-        ok = perms.view_channel and perms.send_messages
-        details = []
-        if not perms.view_channel:
-            details.append("Cannot view")
-        if not perms.send_messages:
-            details.append("Cannot send")
-        if ok:
-            return (True, "OK")
-        return (False, ", ".join(details) if details else "Insufficient permissions")
-
-    req_ok, req_msg = check_channel(req_channel)
-    admin_ok, admin_msg = check_channel(admin_channel)
-
-    embed.add_field(name="Request channel access", value=("✅ OK" if req_ok else f"❌ {req_msg}"), inline=False)
-    embed.add_field(name="Admin channel access", value=("✅ OK" if admin_ok else f"❌ {admin_msg}"), inline=False)
-
-    # RCON connectivity check (non-blocking)
-    try:
-        loop = asyncio.get_event_loop()
-        rcon_ok, rcon_msg = await loop.run_in_executor(client.executor, _check_rcon_sync)
-        if rcon_ok:
-            embed.add_field(name="RCON", value=f"✅ Connected — response: {rcon_msg}", inline=False)
-        else:
-            logger.error(f"RCON health check failed: {rcon_msg}")
-            embed.add_field(name="RCON", value=f"❌ Error: {rcon_msg}", inline=False)
-    except Exception as e:
-        logger.error(f"RCON health check failed: {e}")
-        embed.add_field(name="RCON", value=f"❌ Error: {e}", inline=False)
-
-    return embed
-
-
-async def send_health_report(target_channel=None):
-    embed = await perform_health_check()
-    channel = target_channel or client.get_channel(ADMIN_CHANNEL_ID)
-    if channel:
-        try:
-            await channel.send(embed=embed)
-        except discord.Forbidden:
-            logger.error(f"Missing permissions to send to channel {channel.id}. Bot needs 'Send Messages' and 'View Channel' permissions.")
-        except discord.HTTPException as e:
-            logger.error(f"Failed to send health report (HTTP {e.status}): {e.text}")
-        except Exception as e:
-            logger.error(f"Failed to send health report: {e}")
-    else:
-        logger.error(f"Admin channel ({ADMIN_CHANNEL_ID}) not found; cannot send health report")
-
-
-async def periodic_health_checks_loop():
-    while True:
-        try:
-            await send_health_report()
-        except Exception as e:
-            logger.error(f"Periodic health check error: {e}")
-        await asyncio.sleep(HEALTH_CHECK_INTERVAL)
-
-
-async def scan_unhandled_requests():
-    """Scan request channel for unhandled messages on startup."""
-    logger.info("Scanning request channel for unhandled messages...")
-    try:
-        req_channel = client.get_channel(REQUEST_CHANNEL_ID)
-        if not req_channel:
-            logger.error(f"Cannot scan: request channel {REQUEST_CHANNEL_ID} not found")
-            return
-        
-        # Fetch recent messages (limit to last 100)
-        async for message in req_channel.history(limit=100):
-            # Skip bot's own messages
-            if message.author == client.user:
-                continue
-            
-            # Check if message already has checkmark reaction
-            has_checkmark = any(str(reaction.emoji) == "✅" for reaction in message.reactions)
-            if has_checkmark:
-                continue
-            
-            username = message.content.strip()
-            
-            # Validate format
-            if not is_valid_minecraft_username(username):
-                continue
-            
-            # Check if already whitelisted
-            is_whitelisted, error = await check_if_whitelisted(username)
-            if error:
-                logger.warning(f"Could not check whitelist status for {username}: {error}")
-                continue
-            
-            if is_whitelisted:
-                # Already whitelisted, add checkmark
-                await message.add_reaction("✅")
-                logger.info(f"Found already whitelisted player: {username}")
-                continue
-            
-            # Not whitelisted and no checkmark - process it
-            logger.info(f"Processing unhandled request: {username}")
-            
-            # Check Mojang API
-            exists, uuid, api_error = await check_mojang_username(username)
-            if not exists:
-                await message.add_reaction("❌")
-                logger.info(f"Username {username} does not exist on Mojang")
-                
-                # Create notification channel for invalid username
-                try:
-                    guild = message.guild
-                    if guild:
-                        # Get category if configured
-                        category = None
-                        if APPEAL_CATEGORY_ID:
-                            category = guild.get_channel(APPEAL_CATEGORY_ID)
-                            if category and not isinstance(category, discord.CategoryChannel):
-                                category = None
-                        
-                        # Create notification channel
-                        notif_channel = await guild.create_text_channel(
-                            name=f"invalid-{message.author.name}",
-                            topic=f"Invalid username notification for {username} | user: {message.author.id}",
-                            category=category
-                        )
-                        
-                        # Set permissions: user read-only, admins can write
-                        await notif_channel.set_permissions(guild.default_role, view_channel=False)
-                        await notif_channel.set_permissions(message.author, view_channel=True, send_messages=False)
-                        await notif_channel.set_permissions(client.user, view_channel=True, send_messages=True)
-                        
-                        admin_role = guild.get_role(ADMIN_ROLE_ID)
-                        if admin_role:
-                            await notif_channel.set_permissions(admin_role, view_channel=True, send_messages=True)
-                        
-                        # Send notification
-                        notif_embed = discord.Embed(
-                            title="Invalid Username",
-                            description=f"The username `{username}` does not exist on Mojang's servers.",
-                            color=discord.Color.red()
-                        )
-                        notif_embed.add_field(name="Requested by", value=message.author.mention, inline=False)
-                        notif_embed.add_field(name="Original message", value=message.jump_url, inline=False)
-                        if api_error:
-                            notif_embed.add_field(name="Error", value=api_error, inline=False)
-                        notif_embed.add_field(name="Action", value="Please verify the username spelling and re-request the whitelist in the request channel. This channel will be deleted after you acknowledge.", inline=False)
-                        
-                        await notif_channel.send(f"{message.author.mention}", embed=notif_embed, view=InvalidUsernameView())
-                        
-                        # Delete original message
-                        try:
-                            await message.delete()
-                            logger.info(f"Deleted invalid request message from {message.author}")
-                        except Exception as del_e:
-                            logger.warning(f"Could not delete invalid message: {del_e}")
-                        
-                        logger.info(f"Created notification channel {notif_channel.name} for invalid username")
-                except Exception as notif_e:
-                    logger.error(f"Failed to create notification channel for invalid username: {notif_e}")
-                
-                continue
-            
-            # Mark as pending review and forward to admin (no checkmark until approved)
-            try:
-                await message.add_reaction("⏳")
-            except Exception:
+            except:
                 pass
-            
-            view = WhitelistRequestView(username, request_message=message, request_user=message.author)
-            embed = discord.Embed(
-                title="Whitelist Request (Recovered)",
-                description=f"Request found during startup scan",
-                color=discord.Color.orange()
-            )
-            embed.add_field(name="Username", value=username, inline=False)
-            if uuid:
-                embed.add_field(name="UUID", value=uuid, inline=False)
-            embed.add_field(name="Requested by", value=message.author.mention, inline=False)
-            embed.add_field(name="Original message", value=message.jump_url, inline=False)
-            
-            admin_channel = client.get_channel(ADMIN_CHANNEL_ID)
-            if admin_channel:
-                await admin_channel.send(embed=embed, view=view)
-        
-        logger.info("Request channel scan complete")
-    except Exception as e:
-        logger.error(f"Error scanning request channel: {e}", exc_info=True)
+
 
 
 @client.tree.command(name="health", description="Run bot health checks")
-@app_commands.checks.has_role(ADMIN_ROLE_ID)
+@has_admin_role()
 async def health_command(interaction: discord.Interaction):
     """Slash command to run health checks."""
     await interaction.response.defer(ephemeral=False)
     try:
-        embed = await perform_health_check()
+        embed = await perform_health_check(client)
         await interaction.followup.send(embed=embed)
     except Exception as e:
         logger.error(f"Health command error: {e}")
         await interaction.followup.send(f"Error running health check: {e}", ephemeral=True)
 
 
+@client.tree.command(name="close", description="Close the current appeal channel")
+async def close_command(interaction: discord.Interaction):
+    """Slash command to close temporary appeal channels."""
+    await interaction.response.defer(ephemeral=True)
+    
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.followup.send("This command can only be used in text channels.", ephemeral=True)
+        return
+    
+    if not is_temporary_channel(interaction.channel):
+        await interaction.followup.send("This is not a temporary appeal channel.", ephemeral=True)
+        return
+    
+    author = interaction.user
+    if not isinstance(author, discord.Member):
+        author = interaction.guild.get_member(author.id) if interaction.guild else None
+    
+    if not author or not can_user_close_channel(author, interaction.channel):
+        await interaction.followup.send("You do not have permission to close this channel.", ephemeral=True)
+        return
+    
+    try:
+        await interaction.followup.send("Closing channel...")
+        await interaction.channel.delete(reason=f"Closed via /close by {interaction.user}")
+    except Exception as e:
+        logger.error(f"Failed to close temporary channel: {e}")
+        await interaction.followup.send(f"Failed to close channel: {e}", ephemeral=True)
+
+
+@client.tree.command(name="clear", description="Clear all messages in the current channel")
+@has_admin_role()
+async def clear_command(interaction: discord.Interaction):
+    """Slash command to clear messages in any channel (admin only)."""
+    await interaction.response.defer(ephemeral=False)
+    
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.followup.send("This command can only be used in text channels.")
+        return
+    
+    # Send confirmation view
+    try:
+        await interaction.followup.send(
+            "Are you sure you want to clear all messages in this channel?",
+            view=ClearConfirmView()
+        )
+    except Exception as e:
+        logger.error(f"Failed to present clear confirmation: {e}")
+        await interaction.followup.send(f"Failed to show confirmation: {e}", ephemeral=True)
+
+
+@client.tree.command(name="ping", description="Test latency to Discord, RCON server, and internet")
+async def ping_command(interaction: discord.Interaction):
+    """Slash command to test connectivity and latency."""
+    import time
+    from utils import ping_rcon, ping_host
+    
+    # Measure Discord API latency (websocket heartbeat)
+    discord_latency = client.latency * 1000  # Convert to ms
+    
+    await interaction.response.defer(ephemeral=False)
+    
+    # Create embed
+    embed = discord.Embed(
+        title="🏓 (Ping)Pong Test Results",
+        color=discord.Color.blue()
+    )
+    
+    # Discord WebSocket latency
+    embed.add_field(
+        name="Discord WebSocket",
+        value=f"`{discord_latency:.2f}ms`",
+        inline=False
+    )
+    
+    # Test RCON server
+    rcon_success, rcon_latency, rcon_error = await ping_rcon()
+    if rcon_success and rcon_latency is not None:
+        embed.add_field(
+            # Removed RCON Server IP and port from name for Confidentiality
+            name=f"RCON Server",
+            value=f"✅ `{rcon_latency:.2f}ms`",
+            inline=False
+        )
+    else:
+        embed.add_field(
+            # Removed RCON Server IP and port from name for Confidentiality
+            name=f"RCON Server",
+            value=f"❌ {rcon_error or 'Connection failed'}",
+            inline=False
+        )
+    
+    # Test 1.1.1.1 (Cloudflare DNS)
+    internet_success, internet_latency, internet_error = await ping_host("1.1.1.1", 80, timeout=3.0)
+    if internet_success and internet_latency is not None:
+        embed.add_field(
+            # Removed IP from name for Confidentiality
+            name="Internet",
+            value=f"✅ `{internet_latency:.2f}ms`",
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="Internet",
+            value=f"❌ {internet_error or 'Connection failed'}",
+            inline=False
+        )
+    
+    embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+    
+    await interaction.followup.send(embed=embed)
+
+
+@client.tree.command(name="info", description="Show bot configuration info")
+@has_admin_role()
+async def info_command(interaction: discord.Interaction):
+    """Displays configured channels, roles, and owner."""
+    await interaction.response.defer(ephemeral=True)
+    try:
+        guild = interaction.guild
+
+        # Channels
+        channel_mentions = []
+        if guild:
+            for cid in REQUEST_CHANNEL_IDS:
+                ch = guild.get_channel(cid)
+                channel_mentions.append(ch.mention if ch else f"`{cid}` (not found)")
+            admin_channel = guild.get_channel(ADMIN_CHANNEL_ID)
+            admin_ch_str = admin_channel.mention if admin_channel else f"`{ADMIN_CHANNEL_ID}` (not found)"
+        else:
+            channel_mentions = [f"`{cid}`" for cid in REQUEST_CHANNEL_IDS]
+            admin_ch_str = f"`{ADMIN_CHANNEL_ID}`"
+
+        # Roles
+        role_mentions = []
+        if guild:
+            for rid in ADMIN_ROLE_IDS:
+                r = guild.get_role(rid)
+                role_mentions.append(r.mention if r else f"`{rid}` (not found)")
+        else:
+            role_mentions = [f"`{rid}`" for rid in ADMIN_ROLE_IDS]
+
+        # Owner
+        owner_str = "not configured"
+        if OWNER_USER_ID:
+            if guild:
+                owner_member = guild.get_member(OWNER_USER_ID)
+                if owner_member:
+                    owner_str = owner_member.mention
+                else:
+                    # Fall back to user mention syntax even if not in guild; optionally fetch user
+                    try:
+                        user_obj = await client.fetch_user(OWNER_USER_ID)
+                        owner_str = f"<@{OWNER_USER_ID}>"
+                    except Exception:
+                        owner_str = f"<@{OWNER_USER_ID}>"
+            else:
+                # No guild context; best effort mention
+                owner_str = f"<@{OWNER_USER_ID}>"
+
+        embed = discord.Embed(
+            title="Bot Configuration Info",
+            color=discord.Color.blurple()
+        )
+        embed.add_field(name="Request Channels", value="\n".join(channel_mentions) or "None", inline=False)
+        embed.add_field(name="Admin Channel", value=admin_ch_str, inline=False)
+        embed.add_field(name="Admin Roles", value="\n".join(role_mentions) or "None", inline=False)
+        embed.add_field(name="Owner (user)", value=owner_str, inline=False)
+        warn_role_1_str = "not configured"
+        warn_role_2_str = "not configured"
+        if WARN_ROLE_ID_1:
+            if guild:
+                warn_role_obj_1 = guild.get_role(WARN_ROLE_ID_1)
+                warn_role_1_str = warn_role_obj_1.mention if warn_role_obj_1 else f"`{WARN_ROLE_ID_1}` (not found)"
+            else:
+                warn_role_1_str = f"`{WARN_ROLE_ID_1}`"
+        if WARN_ROLE_ID_2:
+            if guild:
+                warn_role_obj_2 = guild.get_role(WARN_ROLE_ID_2)
+                warn_role_2_str = warn_role_obj_2.mention if warn_role_obj_2 else f"`{WARN_ROLE_ID_2}` (not found)"
+            else:
+                warn_role_2_str = f"`{WARN_ROLE_ID_2}`"
+        embed.add_field(name="Warn Role 1", value=warn_role_1_str, inline=False)
+        embed.add_field(name="Warn Role 2", value=warn_role_2_str, inline=False)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        logger.error(f"Info command error: {e}")
+        await interaction.followup.send(f"Failed to build info: {e}", ephemeral=True)
+
+
+@client.tree.command(name="warn", description="Warn a user with a reason")
+@has_admin_role()
+async def warn_command(interaction: discord.Interaction, member: discord.Member, reason: str | None = None):
+    """Warn a user (in-memory)."""
+    await interaction.response.defer(ephemeral=True)
+    status_msg = None
+    try:
+        status_msg = await interaction.followup.send("Processing warning...", ephemeral=True)
+        warn_role_1 = interaction.guild.get_role(WARN_ROLE_ID_1) if interaction.guild else None
+        warn_role_2 = interaction.guild.get_role(WARN_ROLE_ID_2) if interaction.guild else None
+
+        reason_text = reason.strip() if reason else "No reason provided"
+        warnings = client.warn_map.setdefault(member.id, [])
+        warnings.append(reason_text)
+        # Determine current warning level from roles to avoid relying on channels
+        current_level = _warning_level_from_roles(member)
+        if current_level >= 2:
+            # Already at max level; escalate to manual admin review channel
+            warn_count = 2
+            response_lines = [
+                f"⚠️ {member.mention} is already at the maximum warning level (2).",
+                "A manual review channel will be created for admins to decide next steps.",
+                f"Reason for additional warning attempt: {reason_text}"
+            ]
+
+            try:
+                guild = interaction.guild
+                if guild:
+                    category = None
+                    if APPEAL_CATEGORY_ID:
+                        category = guild.get_channel(APPEAL_CATEGORY_ID)
+                        if category and not isinstance(category, discord.CategoryChannel):
+                            category = None
+
+                    review_channel = await guild.create_text_channel(
+                        name=f"warn-review-{member.name}",
+                        topic=("Warning overflow review | user: "
+                               f"{member.id} | admin: {interaction.user.id}"),
+                        category=category
+                    )
+
+                    # Permissions: admin-only (no user access)
+                    await review_channel.set_permissions(guild.default_role, view_channel=False)
+                    await review_channel.set_permissions(member, view_channel=False, send_messages=False)
+                    await review_channel.set_permissions(interaction.client.user, view_channel=True, send_messages=True)
+                    await review_channel.set_permissions(interaction.user, view_channel=True, send_messages=True)
+                    admin_role = guild.get_role(ADMIN_ROLE_ID)
+                    if admin_role:
+                        await review_channel.set_permissions(admin_role, view_channel=True, send_messages=True)
+
+                    # Notify admins only (user cannot see this channel)
+                    admin_mentions = []
+                    for admin_role_id in ADMIN_ROLE_IDS:
+                        role_obj = guild.get_role(admin_role_id)
+                        if role_obj:
+                            admin_mentions.append(role_obj.mention)
+
+                    await review_channel.send(
+                        f"{interaction.user.mention} {' '.join(admin_mentions)}\n"
+                        f"**({member.name})** has exceeded the maximum warnings (2).\n"
+                        f"Latest reason: {reason_text}\n\n"
+                        f"This is an admin-only channel to discuss next steps."
+                    )
+                    # Log overflow warning attempt to history
+                    try:
+                        warn_history.log_warn(
+                            user_id=member.id,
+                            user_name=str(member),
+                            guild_id=interaction.guild.id,
+                            guild_name=interaction.guild.name,
+                            admin_id=interaction.user.id,
+                            admin_name=str(interaction.user),
+                            reason=f"[OVERFLOW] {reason_text}",
+                            warning_level=2  # Already at max
+                        )
+                    except Exception as hist_e:
+                        logger.error(f"Failed to log overflow warning to history: {hist_e}")
+
+                    # Post warning history in review channel
+                    try:
+                        user_history = warn_history.get_user_history(member.id, interaction.guild.id)
+                        history_embed_data = warn_history.format_history_embed(user_history, str(member))
+                        history_embed = discord.Embed.from_dict(history_embed_data)
+                        await review_channel.send(embed=history_embed)
+                    except Exception as hist_e:
+                        logger.error(f"Failed to post warning history in review channel: {hist_e}")
+
+                    response_lines.append(f"Review channel created: {review_channel.mention}")
+            except Exception as overflow_e:
+                logger.error(f"Failed to create warning overflow review channel: {overflow_e}")
+                response_lines.append(f"⚠️ Failed to create review channel: {overflow_e}")
+
+            final_text = "\n".join(response_lines)
+            if status_msg:
+                try:
+                    await status_msg.edit(content=final_text)
+                except Exception:
+                    await interaction.followup.send(final_text, ephemeral=True)
+            else:
+                await interaction.followup.send(final_text, ephemeral=True)
+            return
+
+        warn_count = min(2, current_level + 1)
+        # Ensure reasons list length is at least warn_count for display
+        if len(warnings) < warn_count:
+            # pad with placeholders if needed
+            while len(warnings) < warn_count:
+                warnings.append("(no reason recorded)")
+
+        role_changes = []
+        role_errors = []
+
+        if warn_count >= 2:
+            # Escalate to warning level 2
+            if warn_role_2:
+                if warn_role_2 not in member.roles:
+                    try:
+                        await member.add_roles(warn_role_2, reason=f"Warning level 2 by {interaction.user} ({reason_text})")
+                        role_changes.append(f"Warn role 2 applied: {warn_role_2.mention}")
+                    except Exception as role_exc:
+                        logger.error(f"Failed to apply warn role 2: {role_exc}")
+                        role_errors.append(f"Warn role 2 not applied: {role_exc}")
+            else:
+                role_errors.append(f"Warn role 2 with ID `{WARN_ROLE_ID_2}` not found in this server.")
+
+            # Remove warn role 1 if still present to keep only the higher tier
+            if warn_role_1 and warn_role_1 in member.roles:
+                try:
+                    await member.remove_roles(warn_role_1, reason=f"Replaced by warning level 2 for {member}")
+                    role_changes.append("Warn role 1 removed (escalated to level 2).")
+                except Exception as role_exc:
+                    logger.error(f"Failed to remove warn role 1 during escalation: {role_exc}")
+                    role_errors.append(f"Warn role 1 not removed during escalation: {role_exc}")
+        else:
+            # Warning level 1
+            if warn_role_1:
+                if warn_role_1 not in member.roles:
+                    try:
+                        await member.add_roles(warn_role_1, reason=f"Warning level 1 by {interaction.user} ({reason_text})")
+                        role_changes.append(f"Warn role 1 applied: {warn_role_1.mention}")
+                    except Exception as role_exc:
+                        logger.error(f"Failed to apply warn role 1: {role_exc}")
+                        role_errors.append(f"Warn role 1 not applied: {role_exc}")
+            else:
+                role_errors.append(f"Warn role 1 with ID `{WARN_ROLE_ID_1}` not found in this server.")
+
+        response_lines = [
+            f"⚠️ {member.mention} has been warned. Total warnings: {len(warnings)}",
+            f"Reason: {reason_text}"
+        ]
+        response_lines.extend(role_changes)
+        response_lines.extend(role_errors)
+
+        # Log warning to history file
+        try:
+            warn_history.log_warn(
+                user_id=member.id,
+                user_name=str(member),
+                guild_id=interaction.guild.id,
+                guild_name=interaction.guild.name,
+                admin_id=interaction.user.id,
+                admin_name=str(interaction.user),
+                reason=reason_text,
+                warning_level=warn_count
+            )
+        except Exception as hist_e:
+            logger.error(f"Failed to log warning to history: {hist_e}")
+
+        # Create appeal channel for warning acknowledgment
+        try:
+            guild = interaction.guild
+            if guild:
+                category = None
+                if APPEAL_CATEGORY_ID:
+                    category = guild.get_channel(APPEAL_CATEGORY_ID)
+                    if category and not isinstance(category, discord.CategoryChannel):
+                        logger.warning(f"APPEAL_CATEGORY_ID {APPEAL_CATEGORY_ID} is not a category channel")
+                        category = None
+                
+                # Create warning appeal channel
+                warn_appeal_channel = await guild.create_text_channel(
+                    name=f"warn-{member.name}",
+                    topic=f"Warning appeal channel for {member.name} | admin: {interaction.user.id} | user: {member.id} | level: {len(warnings)}",
+                    category=category
+                )
+                
+                # Set permissions: user can read, admins can write, others hidden
+                await warn_appeal_channel.set_permissions(guild.default_role, view_channel=False)
+                await warn_appeal_channel.set_permissions(member, view_channel=True, send_messages=True)
+                await warn_appeal_channel.set_permissions(interaction.client.user, view_channel=True, send_messages=True)
+                await warn_appeal_channel.set_permissions(interaction.user, view_channel=True, send_messages=True)
+                
+                admin_role = guild.get_role(ADMIN_ROLE_ID)
+                if admin_role:
+                    await warn_appeal_channel.set_permissions(admin_role, view_channel=True, send_messages=True)
+                
+                # Create warning notification embed
+                warn_embed = discord.Embed(
+                    title=f"Warning Level {len(warnings)}",
+                    description=f"You have been warned in {guild.name}.",
+                    color=discord.Color.orange()
+                )
+                warn_embed.add_field(name="Reason", value=reason_text, inline=False)
+                warn_embed.add_field(name="Total Warnings", value=str(len(warnings)), inline=False)
+                warn_embed.add_field(name="Warned by", value=interaction.user.mention, inline=False)
+                if len(warnings) == 1:
+                    warn_embed.add_field(
+                        name="Next Steps",
+                        value=f"You may discuss your warning with the admins here. Afterwards, please acknowledge this warning by clicking the button below. After acknowledgment, you will lose read access to this channel and admins can archive it.",
+                        inline=False
+                    )
+                else:
+                    warn_embed.add_field(
+                        name="Next Steps",
+                        value=f"You may discuss your warning with the admins here. Afterwards, please acknowledge this warning by clicking the button below. After acknowledgment, you will lose read access to this channel and admins can archive it.",
+                        inline=False
+                    )
+                
+                await warn_appeal_channel.send(f"{member.mention}", embed=warn_embed, view=WarningAcknowledgeView())
+                
+                # Send notification to admins and delete it after they see it
+                admin_mentions = []
+                for admin_role_id in ADMIN_ROLE_IDS:
+                    admin_role = guild.get_role(admin_role_id)
+                    if admin_role:
+                        admin_mentions.append(admin_role.mention)
+                
+                notif_msg = await warn_appeal_channel.send(
+                    f"{interaction.user.mention}",
+                    delete_after=2  # Auto-delete after 2 seconds
+                )
+                
+                response_lines.append(f"Warning appeal channel created: {warn_appeal_channel.mention}")
+                logger.info(f"Created warning appeal channel {warn_appeal_channel.name} for {member}")
+        except Exception as appeal_e:
+            logger.error(f"Failed to create warning appeal channel: {appeal_e}")
+            response_lines.append(f"⚠️ Warning appeal channel creation failed: {appeal_e}")
+
+        final_text = "\n".join(response_lines)
+        if status_msg:
+            try:
+                await status_msg.edit(content=final_text)
+            except Exception:
+                await interaction.followup.send(final_text, ephemeral=True)
+        else:
+            await interaction.followup.send(final_text, ephemeral=True)
+        # try:
+        #     await member.send(f"You have been warned in {interaction.guild.name}: {reason_text}\n\nA warning appeal channel has been created for you to acknowledge the warning.")
+        # except Exception:
+        #     pass
+    except Exception as e:
+        logger.error(f"Warn command error: {e}")
+        fail_text = f"Failed to warn: {e}"
+        if status_msg:
+            try:
+                await status_msg.edit(content=fail_text)
+            except Exception:
+                await interaction.followup.send(fail_text, ephemeral=True)
+        else:
+            await interaction.followup.send(fail_text, ephemeral=True)
+
+
+@client.tree.command(name="unwarn", description="Remove the most recent warning from a user")
+@has_admin_role()
+async def unwarn_command(interaction: discord.Interaction, member: discord.Member):
+    """Remove the latest warning (in-memory). Alternative name: /clearwarn."""
+    await interaction.response.defer(ephemeral=True)
+    try:
+        warn_role_1 = interaction.guild.get_role(WARN_ROLE_ID_1) if interaction.guild else None
+        warn_role_2 = interaction.guild.get_role(WARN_ROLE_ID_2) if interaction.guild else None
+        warnings = client.warn_map.get(member.id, [])
+        current_level = _warning_level_from_roles(member)
+        if current_level == 0 and not warnings:
+            await interaction.followup.send(f"{member.mention} has no warnings to remove.", ephemeral=True)
+            return
+
+        # Derive new level based on roles, decrement by one
+        new_level = max(current_level - 1, 0)
+
+        removed = "(no reason recorded)"
+        if warnings:
+            removed = warnings.pop()
+        if new_level == 0:
+            client.warn_map.pop(member.id, None)
+        else:
+            # Trim reasons to new_level
+            warnings = warnings[:new_level]
+            client.warn_map[member.id] = warnings
+        warn_count = new_level
+
+        role_changes = []
+        role_errors = []
+
+        if warn_count == 0:
+            # Clear all warn roles
+            for role_obj, role_label in ((warn_role_1, "Warn role 1"), (warn_role_2, "Warn role 2")):
+                if role_obj and role_obj in member.roles:
+                    try:
+                        await member.remove_roles(role_obj, reason=f"Warnings cleared by {interaction.user}")
+                        role_changes.append(f"{role_label} removed.")
+                    except Exception as role_exc:
+                        logger.error(f"Failed to remove {role_label.lower()}: {role_exc}")
+                        role_errors.append(f"{role_label} not removed: {role_exc}")
+        elif warn_count == 1:
+            # Should have warn role 1 only
+            if warn_role_2 and warn_role_2 in member.roles:
+                try:
+                    await member.remove_roles(warn_role_2, reason=f"Demoted to warning level 1 by {interaction.user}")
+                    role_changes.append("Warn role 2 removed (demoted to level 1).")
+                except Exception as role_exc:
+                    logger.error(f"Failed to remove warn role 2 during demotion: {role_exc}")
+                    role_errors.append(f"Warn role 2 not removed during demotion: {role_exc}")
+            if warn_role_1 and warn_role_1 not in member.roles:
+                try:
+                    await member.add_roles(warn_role_1, reason=f"Warning level 1 by {interaction.user}")
+                    role_changes.append(f"Warn role 1 applied: {warn_role_1.mention}")
+                except Exception as role_exc:
+                    logger.error(f"Failed to apply warn role 1 after demotion: {role_exc}")
+                    role_errors.append(f"Warn role 1 not applied after demotion: {role_exc}")
+        else:
+            # warn_count >= 2 => ensure level 2 role present
+            if warn_role_2 and warn_role_2 not in member.roles:
+                try:
+                    await member.add_roles(warn_role_2, reason=f"Warning level 2 by {interaction.user}")
+                    role_changes.append(f"Warn role 2 applied: {warn_role_2.mention}")
+                except Exception as role_exc:
+                    logger.error(f"Failed to apply warn role 2 after unwarn: {role_exc}")
+                    role_errors.append(f"Warn role 2 not applied after unwarn: {role_exc}")
+            if warn_role_1 and warn_role_1 in member.roles:
+                try:
+                    await member.remove_roles(warn_role_1, reason=f"Warning level 2 retains only higher tier for {member}")
+                    role_changes.append("Warn role 1 removed (level 2 retained).")
+                except Exception as role_exc:
+                    logger.error(f"Failed to remove warn role 1 while retaining level 2: {role_exc}")
+                    role_errors.append(f"Warn role 1 not removed while retaining level 2: {role_exc}")
+
+        response_lines = [
+            f"✅ Removed latest warning for {member.mention}. Remaining warnings: {len(warnings)}",
+            f"Removed: {removed}"
+        ]
+        response_lines.extend(role_changes)
+        response_lines.extend(role_errors)
+
+        # Log unwarn to history file
+        try:
+            warn_history.log_unwarn(
+                user_id=member.id,
+                user_name=str(member),
+                guild_id=interaction.guild.id,
+                guild_name=interaction.guild.name,
+                admin_id=interaction.user.id,
+                admin_name=str(interaction.user),
+                previous_level=current_level,
+                new_level=new_level
+            )
+        except Exception as hist_e:
+            logger.error(f"Failed to log unwarn to history: {hist_e}")
+
+        await interaction.followup.send("\n".join(response_lines), ephemeral=True)
+    except Exception as e:
+        logger.error(f"Unwarn command error: {e}")
+        await interaction.followup.send(f"Failed to unwarn: {e}", ephemeral=True)
+
+
+@client.tree.command(name="warnings", description="Show warnings for a user")
+@has_admin_role()
+async def warnings_command(interaction: discord.Interaction, member: discord.Member):
+    """Show current warnings and reasons for a user."""
+    await interaction.response.defer(ephemeral=True)
+    try:
+        role_level = _warning_level_from_roles(member)
+        if role_level == 0:
+            await interaction.followup.send(f"{member.mention} has no warnings.", ephemeral=True)
+            return
+
+        # Get warning history from file to display with timestamps
+        user_history = warn_history.get_user_history(member.id, interaction.guild.id)
+        warn_entries = [entry for entry in user_history if entry.get("action") == "warn"]
+        
+        embed = discord.Embed(
+            title=f"Warnings for {member.display_name}",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="Current Warning Level", value=str(role_level), inline=False)
+        
+        # Show most recent warnings up to current level
+        recent_warns = sorted(warn_entries, key=lambda x: x.get("timestamp", ""), reverse=True)[:role_level]
+        recent_warns.reverse()  # Show oldest to newest
+        
+        for idx, entry in enumerate(recent_warns, start=1):
+            reason = entry.get("reason", "No reason provided")
+            timestamp = entry.get("timestamp", "unknown")
+            admin_name = entry.get("admin_name", "unknown")
+            
+            # Format timestamp
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(timestamp)
+                time_str = dt.strftime("%Y-%m-%d %H:%M UTC")
+            except:
+                time_str = timestamp
+            
+            field_value = f"**Reason:** {reason}\n**By:** {admin_name}\n**When:** {time_str}"
+            embed.add_field(name=f"Warning {idx}", value=field_value, inline=False)
+        
+        # If we don't have enough history entries, note that
+        if len(recent_warns) < role_level:
+            embed.set_footer(text=f"Note: Only {len(recent_warns)} of {role_level} warnings have detailed history")
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        logger.error(f"Warnings command error: {e}")
+        await interaction.followup.send(f"Failed to fetch warnings: {e}", ephemeral=True)
+
+
 @client.event
 async def on_ready():
+    """Called when the bot connects to Discord."""
     logger.info(f'{client.user} has connected to Discord!')
+    
+    # Set presence/activity based on configuration
+    try:
+        activity = None
+        stype = STATUS_TYPE
+        text = STATUS_TEXT
+        if stype == 'playing':
+            activity = discord.Game(name=text)
+        elif stype == 'listening':
+            activity = discord.Activity(type=discord.ActivityType.listening, name=text)
+        elif stype == 'watching':
+            activity = discord.Activity(type=discord.ActivityType.watching, name=text)
+        elif stype == 'competing':
+            activity = discord.Activity(type=discord.ActivityType.competing, name=text)
+        elif stype == 'streaming' and STATUS_STREAM_URL:
+            activity = discord.Streaming(name=text, url=STATUS_STREAM_URL)
+        else:
+            # Fallback to playing if invalid type
+            activity = discord.Game(name=text)
+            if stype not in ('playing','listening','watching','competing','streaming'):
+                logger.warning(f"Unknown STATUS_TYPE '{stype}', defaulting to 'playing'")
+        await client.change_presence(activity=activity)
+        logger.info(f"Presence set: {stype} '{text}'")
+    except Exception as e:
+        logger.error(f"Failed to set presence: {e}")
+    
     # Scan for unhandled requests
     try:
-        asyncio.create_task(scan_unhandled_requests())
+        asyncio.create_task(scan_unhandled_requests(client, client.executor))
     except Exception as e:
         logger.error(f"Failed to start request scan: {e}")
-    # Start periodic checks (first run happens after initial interval)
+    
+    # Start periodic checks if enabled
     if ENABLE_HEALTH_CHECKS:
         try:
-            asyncio.create_task(periodic_health_checks_loop())
-            logger.info(f"Health checks enabled (interval: {HEALTH_CHECK_INTERVAL}s)")
+            asyncio.create_task(periodic_health_checks_loop(client))
+            logger.info(f"Health checks enabled")
         except Exception as e:
             logger.error(f"Failed to start health check tasks: {e}")
     else:
         logger.info("Health checks disabled via ENABLE_HEALTH_CHECKS")
 
+    # Ensure Support Center launcher message exists; recreate if missing
+    try:
+        support_channel = client.get_channel(SUPPORT_CHANNEL_ID) if SUPPORT_CHANNEL_ID else None
+        if support_channel and isinstance(support_channel, discord.TextChannel):
+            exists = False
+            launcher_msg = None
+            try:
+                async for msg in support_channel.history(limit=50):
+                    if msg.author.id == client.user.id and msg.embeds:
+                        for emb in msg.embeds:
+                            if emb.title == "Support Center":
+                                exists = True
+                                launcher_msg = msg
+                                break
+                    if exists:
+                        break
+            except Exception as hist_e:
+                logger.warning(f"Failed to check existing Support Center message: {hist_e}")
+
+            if not exists:
+                embed = discord.Embed(
+                    title="Support Center",
+                    description=(
+                        "Need help? Create a support case to chat with the team.\nWe will reach out within 24 hours.\n\n"
+                        "Click the button below to open a temporary support channel for you."
+                    ),
+                    color=discord.Color.blue()
+                )
+                await support_channel.send(embed=embed, view=SupportLauncherView())
+                logger.info("Posted Support Center launcher in support channel (created).")
+            else:
+                # Re-attach view to existing message to ensure buttons work after restart
+                if launcher_msg:
+                    try:
+                        await launcher_msg.edit(view=SupportLauncherView())
+                        logger.info("Support Center launcher already present; re-attached view.")
+                    except Exception as e:
+                        logger.warning(f"Failed to re-attach SupportLauncherView: {e}")
+        else:
+            logger.warning("SUPPORT_CHANNEL_ID is not configured or not a text channel.")
+    except Exception as e:
+        logger.error(f"Failed to ensure Support Center launcher: {e}")
+    
+    # Re-attach SupportCaseView to existing support case messages for button persistence
+    # This ensures buttons work even if the bot was restarted after cases were created
+    try:
+        for guild in client.guilds:
+            for channel in guild.text_channels:
+                # Only check channels named support-* (support cases)
+                if channel.name.startswith("support-") and not channel.name.startswith("support-ddmm"):
+                    try:
+                        async for msg in channel.history(limit=10):
+                            if msg.author.id == client.user.id and msg.embeds:
+                                for emb in msg.embeds:
+                                    if emb.title == "Support Case":
+                                        # Re-attach the view to this message
+                                        await msg.edit(view=SupportCaseView())
+                                        logger.debug(f"Re-attached SupportCaseView to message in {channel.name}")
+                                        break
+                    except Exception as ch_e:
+                        pass  # Silently skip channels with permission issues
+    except Exception as e:
+        logger.debug(f"Failed to re-attach support case views: {e}")
+
 
 @client.event
-async def on_message(message):
+async def on_message(message: discord.Message):
+    """Handle incoming messages."""
     # Ignore messages from the bot itself
     if message.author == client.user:
         return
-    # Handle !close in temporary channels
-    try:
-        if isinstance(message.channel, discord.TextChannel) and is_temporary_channel(message.channel):
-            content = message.content.strip().lower()
-            if content == '!close':
-                if not isinstance(message.author, discord.Member):
-                    # Fetch member from guild if needed
-                    author = message.guild.get_member(message.author.id) if message.guild else None
-                else:
-                    author = message.author
-                if not author or not can_user_close_channel(author, message.channel):
-                    await message.channel.send("You do not have permission to close this channel.")
-                    return
-                try:
-                    await message.channel.send("Closing channel...")
-                    await message.channel.delete(reason=f"Closed via !close by {message.author}")
-                except Exception as e:
-                    logger.error(f"Failed to close temporary channel: {e}")
-                return
-        else:
-            content = message.content.strip().lower()
-            if content == '!clear':
-                # Confirmation flow
-                try:
-                    await message.channel.send("Are you sure you want to clear all messages in this channel?", view=ClearConfirmView())
-                except Exception as e:
-                    logger.error(f"Failed to present clear confirmation: {e}")
-                return
-    except Exception as e:
-        logger.error(f"Error handling !close command: {e}")
-
-    # Check if message is in the request channel
-    if message.channel.id == REQUEST_CHANNEL_ID:
-        # Extract username from message (assuming the message contains just the username)
-        username = message.content.strip()
-        
-        # If this user has a previous invalid attempt, delete it now
-        key = (message.channel.id, message.author.id)
-        await _cleanup_entry_now(key)
-
-        # Skip if already has checkmark (already processed)
-        has_checkmark = any(str(reaction.emoji) == "✅" for reaction in message.reactions)
-        if has_checkmark:
-            return
-        
-        # Validate username format
-        if not is_valid_minecraft_username(username):
-            await message.add_reaction("❌")
-            error_msg = await message.channel.send(
-                f"Invalid username format. Minecraft usernames must be 3-16 characters, "
-                f"containing only letters, numbers, and underscores."
-            )
-            # Schedule cleanup after 5 minutes or next message
-            await _schedule_cleanup(key, user_msg=message, error_msg=error_msg, delay_seconds=300)
-            return
-        
-        # Check with Mojang API (no reaction yet, just validation)
-        exists, uuid, error = await check_mojang_username(username)
-        
-        if not exists:
-            await message.add_reaction("❌")
-            error_msg = await message.channel.send(
-                f"Username `{username}` does not exist on Mojang servers. {error if error else ''}"
-            )
-            # Schedule cleanup after 5 minutes or next message
-            await _schedule_cleanup(key, user_msg=message, error_msg=error_msg, delay_seconds=300)
-            return
-        
-        # Username valid and exists - mark pending and forward to admin for approval
-        # Don't add checkmark until admin approves
-        
-        # Create the view with approve/deny buttons
-        view = WhitelistRequestView(username, request_message=message, request_user=message.author)
-        
-        # Create embed for admin channel
-        embed = discord.Embed(
-            title="Whitelist Request",
-            description=f"New whitelist request received",
-            color=discord.Color.blue()
-        )
-        embed.add_field(name="Username", value=username, inline=False)
-        if uuid:
-            embed.add_field(name="UUID", value=uuid, inline=False)
-        embed.add_field(name="Requested by", value=message.author.mention, inline=False)
-        embed.add_field(name="Channel", value=message.channel.mention, inline=False)
-        
-        # Send to admin channel
-        admin_channel = client.get_channel(ADMIN_CHANNEL_ID)
-        if admin_channel:
-            # Add hourglass pending review
-            try:
-                await message.add_reaction("⏳")
-            except Exception:
-                pass
-            await admin_channel.send(embed=embed, view=view)
-        else:
-            error_msg = f"Could not find admin channel with ID {ADMIN_CHANNEL_ID}"
-            logger.error(error_msg)
-            await message.channel.send(
-                "Sorry, there was an error processing your whitelist request. "
-                "Please contact an administrator."
-            )
+    
+    # Debug logging
+    logger.debug(f"Message received from {message.author}: {message.content}")
+    
+    # Handle whitelist requests in request channels
+    if message.channel.id in REQUEST_CHANNEL_IDS:
+        logger.debug(f"Request channel detected: {message.channel.id}")
+        await handle_whitelist_request(message, client, client.cleanup_map, client.executor)
 
 
-# Run the bot
-if __name__ == "__main__":
+def run():
+    """Start the Discord bot."""
     try:
         logger.info("Starting bot...")
         client.run(DISCORD_TOKEN, log_handler=None)
@@ -1090,3 +1003,7 @@ if __name__ == "__main__":
         logger.error(f"HTTP error occurred: {e}")
     except Exception as e:
         logger.error(f"Failed to start bot: {e}", exc_info=True)
+
+
+if __name__ == "__main__":
+    run()
